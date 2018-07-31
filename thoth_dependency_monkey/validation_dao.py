@@ -21,7 +21,13 @@
 import os
 import logging
 import uuid
+import re
+import json
+import urllib.request
 
+from distutils.version import StrictVersion,LooseVersion
+from itertools import product
+import delegator
 from werkzeug.exceptions import BadRequest, ServiceUnavailable, NotImplemented
 from tempfile import NamedTemporaryFile
 from kubernetes import client, config
@@ -74,6 +80,43 @@ class ValidationDAO():
 
         except:
             logger.info("not running within an OpenShift cluster...")
+
+    def get_all_versions(self,package_name,version_no,char):
+        """method to get all versions from pypi"""
+        #TODO: Can we do the try catch block better ?
+        pypi_url = "https://pypi.python.org/pypi/%s/json" % (package_name,)
+        #Add exception handling for nonexistent Packages
+        try : 
+            urllib.request.urlopen(pypi_url)
+            with urllib.request.urlopen(pypi_url) as response:
+                data = json.loads(response.read().decode())
+            versions = data["releases"].keys()
+            versions = list(versions)
+            b = ["rc","b","p1","b1"]
+            versions = [x for x in versions if not any(y in x for y in b)]
+            #TODO:Can we do this better 
+            if char == "==" or char =="===" or char == "=":
+                versions = [x for x in versions if LooseVersion(x) == LooseVersion(version_no)]
+            elif char == ">":
+                versions = [x for x in versions if LooseVersion(x) > LooseVersion(version_no)]
+            elif char ==">=":
+                versions = [x for x in versions if LooseVersion(x) >= LooseVersion(version_no)]
+            elif char == "<":
+                versions = [x for x in versions if LooseVersion(x) < LooseVersion(version_no)]
+            elif char == "<=":
+                versions = [x for x in versions if LooseVersion(x) <= LooseVersion(version_no)]
+            elif char == "!=":
+                versions = [x for x in versions if LooseVersion(x) != LooseVersion(version_no)]
+            else:
+                versions = [x for x in versions if LooseVersion(x) > LooseVersion(version_no)]
+            sorted(versions,key=LooseVersion)
+            return versions
+        except urllib.error.HTTPError as e:
+            logger.error(e)
+            if e.status == 404:
+                raise ValueError("Entered package doesn't exist. Please enter correct package name.")
+
+
 
     def get(self, id):
         v = {}
@@ -139,6 +182,29 @@ class ValidationDAO():
 
         if v['ecosystem'] not in ECOSYSTEM:
             raise EcosystemNotSupportedError(v['ecosystem'])
+
+        packages = v['stack_specification']
+        packages = packages.split("//")
+        package_versions = dict()
+        for name in packages:
+            self._pckg_name = re.findall("[a-zA-Z]+", name)
+            #checks if package name not entered
+            if not self._pckg_name:
+                break
+            #if incorrect version number or character,default is >0
+            self._ver_no = re.findall(r'\s*([\d.]+)', name)
+            if not ver_no:
+                ver_no = "0"
+            else:
+                ver_no = ver_no[0]
+            self._char = re.sub("[\w+.]", "", name)
+            if not self._char:
+                char = ">"
+            temp_dict = dict()
+            temp_dict = {pckg_name[0]:get_all_versions(self._pckg_name[0],self._ver_no,self._char)}
+            package_versions = {**package_versions,**temp_dict}
+            my_list = [dict(zip(package_versions,v)) for v in product(*package_versions.values())]
+            #Push everything in my_list to a CD pipeline on openshift
 
         # check if stack_specification is valid
         if not self._validate_requirements(v['stack_specification']):
