@@ -22,18 +22,15 @@ import os
 import logging
 import uuid
 import re
-import json
-import urllib.request
 
-from distutils.version import StrictVersion,LooseVersion
+from distutils.version import LooseVersion
 from itertools import product
-import delegator
 from werkzeug.exceptions import BadRequest, ServiceUnavailable, NotImplemented
 from tempfile import NamedTemporaryFile
 from kubernetes import client, config
-from kubernetes.client import api_client
-from kubernetes.client.apis import batch_v1_api
+import requests
 
+from .exceptions import NotFoundError
 
 from .ecosystem import ECOSYSTEM, EcosystemNotSupportedError
 
@@ -46,32 +43,18 @@ THOTH_DEPENDENCY_MONKEY_NAMESPACE = os.getenv(
 VALIDATION_JOB_PREFIX = 'validation-job-'
 
 logging.basicConfig()
-logger = logging.getLogger(__file__)
-
-logger.setLevel(logging.DEBUG)
-
-
-class NotFoundError(BadRequest):
-    """Exception raised if a Validation does not exist.
-
-    Attributes:
-        id -- id of the Validation that does not exist
-        message -- verbal representation
-    """
-
-    def __init__(self, id):
-        self.id = id
-        self.message = "Validation {} doesn't exist".format(id)
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.setLevel(logging.DEBUG)
 
 
 class ValidationDAO():
     def __init__(self):
         self.BEARER_TOKEN = None
 
-        # if we can read bearer token from /var/run/secrets/kubernetes.io/serviceaccount/token use it,
-        # otherwise use the one from env
+        #if we can read bearer token from /var/run/secrets/kubernetes.io/serviceaccount/token use it
+        #otherwise use the one from env
         try:
-            logger.debug(
+            _LOGGER.debug(
                 'trying to get bearer token from secrets file within pod...')
             with open('/var/run/secrets/kubernetes.io/serviceaccount/token') as f:
                 self.BEARER_TOKEN = f.read()
@@ -79,27 +62,31 @@ class ValidationDAO():
             self.SSL_CA_CERT_FILENAME = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
 
         except:
-            logger.info("not running within an OpenShift cluster...")
+            _LOGGER.info("not running within an OpenShift cluster...")
 
-    def get_all_versions(self,package_name,version_no,char):
+
+    def _get_all_versions(self, package_name, version_no, char):
         """method to get all versions from pypi"""
-        #TODO: Can we do the try catch block better ?
+        start = 5
+        stop = 10
         pypi_url = "https://pypi.python.org/pypi/%s/json" % (package_name,)
-        #Add exception handling for nonexistent Packages
-        try : 
-            urllib.request.urlopen(pypi_url)
-            with urllib.request.urlopen(pypi_url) as response:
-                data = json.loads(response.read().decode())
+        try:
+            r = requests.get(pypi_url, verify=False)
+        except requests.exceptions.HTTPError as exc:
+            _LOGGER.error(exc)
+            return []
+        else:
+            data = r.json()
             versions = data["releases"].keys()
             versions = list(versions)
-            b = ["rc","b","p1","b1"]
-            versions = [x for x in versions if not any(y in x for y in b)]
-            #TODO:Can we do this better 
-            if char == "==" or char =="===" or char == "=":
+            eliminations = ["rc", "b", "p1", "b1"]
+            versions = [x for x in versions if not any(y in x for y in eliminations)]
+            #TODO:Can we do this better?
+            if char == "==" or char == "===" or char == "=":
                 versions = [x for x in versions if LooseVersion(x) == LooseVersion(version_no)]
             elif char == ">":
                 versions = [x for x in versions if LooseVersion(x) > LooseVersion(version_no)]
-            elif char ==">=":
+            elif char == ">=":
                 versions = [x for x in versions if LooseVersion(x) >= LooseVersion(version_no)]
             elif char == "<":
                 versions = [x for x in versions if LooseVersion(x) < LooseVersion(version_no)]
@@ -109,14 +96,13 @@ class ValidationDAO():
                 versions = [x for x in versions if LooseVersion(x) != LooseVersion(version_no)]
             else:
                 versions = [x for x in versions if LooseVersion(x) > LooseVersion(version_no)]
-            sorted(versions,key=LooseVersion)
+            sorted(versions, key=LooseVersion)
+            versions = islice(versions, start, stop)
             return versions
-        except urllib.error.HTTPError as e:
-            logger.error(e)
-            if e.status == 404:
-                logger.error(e)
+
 
     def get(self, id):
+        """Get stack validation for requested ID"""
         v = {}
 
         v['id'] = id
@@ -156,7 +142,9 @@ class ValidationDAO():
 
         return v
 
+
     def get_all(self):
+        """Get all stack validations"""
         jobs = self._get_all_scheduled_validation_job()
 
         if len(jobs) > 0:
@@ -170,21 +158,44 @@ class ValidationDAO():
                     result.append(
                         {'id': str(job.metadata.labels['validation-id'])})
 
-            logger.debug('found the following validations: {}'.format(result))
+            _LOGGER.debug('found the following validations: {}'.format(result))
             return result
         else:
             return []
 
+
     def create(self, data):
+        """Creates a validation job for the given stack specification"""
         v = data
 
         if v['ecosystem'] not in ECOSYSTEM:
             raise EcosystemNotSupportedError(v['ecosystem'])
 
+        if v['stack_specification'] == " ":
+            raise IncorrectStackFormatError("Input stack is empty")
+
+        data_ingestion_mode = True
+        if data_ingestion_mode == True:
+            data_ingestion(v)
+            return v
+        
+        # check if stack_specification is valid
+        if not self._validate_requirements(v['stack_specification']):
+            raise BadRequest('specification is not valid within Ecosystem {}'.format(v['ecosystem']))
+
+        v['phase'] = 'pending'
+        v['id'] = str(uuid.uuid4())
+        self._schedule_validation_job(v['id'], v['stack_specification'], v['ecosystem'])
+
+        return v
+
+
+    def data_ingestion(self, v):
+        """Function to create large number of validation jobs for range of version indices"""
+
         packages = v['stack_specification']
         packages = packages.split("//")
         package_versions = dict()
-        block-size = 10
         for name in packages:
             pckg_name = re.findall("[a-zA-Z]+", name)
             #checks if package name not entered
@@ -200,37 +211,34 @@ class ValidationDAO():
             if not char:
                 char = ">"
             temp_dict = dict()
-            temp_dict = {pckg_name[0]:get_all_versions(pckg_name[0],ver_no,char)}
-            #currently limited to latest 10 package versions
-            for key,value in temp_dict.items():
-                value = value[-block-size:]
-                temp_dict[key] = value
+            temp_dict = {pckg_name[0]:self._get_all_versions(pckg_name[0], ver_no, char)}
 
-            package_versions = {**package_versions,**temp_dict}
+            package_versions = {**package_versions, **temp_dict}
+
+        package_versions_list = [dict(zip(package_versions, v)) for v in product(*package_versions.values())]
         
-        my_list = [dict(zip(package_versions,v)) for v in product(*package_versions.values())]
-        #Push everything in my_list to a CD pipeline on openshift
+        try: # for pip >= 10
+            from pip._internal.req import parse_requirements
+        except ImportError: #for pip <=9.0.3
+            from pip.req import parse_requirements
 
-        # check if stack_specification is valid
-        for item in my_list:
-            if not self._validate_requirements(v['stack_specification']):
-                raise BadRequest('specification is not valid within Ecosystem {}'.format(v['ecosystem']))
+        for spec in package_versions_list:
+            with NamedTemporaryFile(mode='w+', suffix='pysolve') as reqfile:
+                for key, value in spec.items():
+                    reqfile.write('{0}=={1}\n'.format(key, value))
+                    reqfile.flush()
+            self._schedule_validation_job(v['id'], reqfile, v['ecosystem'])
 
-            v['phase'] = 'pending'
-            v['id'] = str(uuid.uuid4())
-            #how to schedule validation job
-            self._schedule_validation_job(
-                v['id'], v['stack_specification'], v['ecosystem'])
-
-        return v
 
     def delete(self, id):
+        """Delete a stack validation with given ID"""
         # TODO add kubernetes job stuff
         raise NotImplemented()  # pylint: disable=E0711
 
+
     def _validate_requirements(self, spec):
         """This function will check if the syntax of the provided specification is valid"""
-        #TODO : Can this be avoided or done better ?
+        #TODO : Primary validation can be done better.
         #There have been problems with pip>10
         try: # for pip >= 10
             from pip._internal.req import parse_requirements
@@ -239,25 +247,28 @@ class ValidationDAO():
 
         # create a temporary file and store the spec there since
         # `parse_requirements` requires a file
-        with NamedTemporaryFile(mode='w+', suffix='pysolve') as f:
-            f.write(spec)
-            f.flush()
-            reqs = parse_requirements(f.name, session=f.name)
+        with NamedTemporaryFile(mode='w+', suffix='pysolve') as reqfile:
+            reqfile.write(spec)
+            reqfile.flush()
+            reqs = parse_requirements(reqfile.name, session=reqfile.name)
 
         if reqs:
             return True
 
         return False
 
+
     def _whats_my_name(self, id):
+        """Returns the validation job ID"""
         return VALIDATION_JOB_PREFIX + str(id)
 
-    def _schedule_validation_job(self, id, spec, ecosystem):  # pragma: no cover
-        logger.debug('scheduling validation id {}'.format(id))
+
+    def _schedule_validation_job(self, id, spec, ecosystem):#pragma:no cover
+        """Schdeules a validation job for the given stack specification"""
+        _LOGGER.debug('scheduling validation id {}'.format(id))
 
         _name = self._whats_my_name(id)
         # TODO select validator image based on ecosystem
-        #How are we doing this ?
         # _image = self._job_image_name(ecosystem)
 
         _job_manifest = {
@@ -265,7 +276,7 @@ class ValidationDAO():
             'spec': {
                 'template':
                     {
-                        'metadata': {'labels': {'validation-id': str(id)}},
+                        'metadata': {'labels': {'validation-id': str(id)}}, 'name': _name,
                         'spec':
                         {'serviceAccountName': 'validation-job-runner',
                          'containers': [
@@ -292,34 +303,45 @@ class ValidationDAO():
                                  ]
                              }
                          ],
-                            'restartPolicy': 'Never'},
-                        'metadata': {'name': _name}}},
+                         'restartPolicy': 'Never'}}},
             'apiVersion': 'batch/v1',
             'metadata': {'name': _name, 'labels': {'validation-id': str(id)}}
         }
 
         # if we got no BEARER_TOKEN, we use local config
+
+        from openshift.dynamic import DynamicClient
+
+        k8s_client = config.new_client_from_config()
+        dyn_client = DynamicClient(k8s_client)
+
+        v1_services = dyn_client.resources.get(api_version='v1', kind='Service')
+        _resp = v1_services.create(body=_job_manifest, namespace=THOTH_DEPENDENCY_MONKEY_NAMESPACE)
+
         if self.BEARER_TOKEN is None:
             config.load_kube_config()
         else:
             config.load_incluster_config()
-
+        """
         _client = client.CoreV1Api()
         _api = client.BatchV1Api()
+        """
 
         try:
-            _resp = _api.create_namespaced_job(
+            _resp = dyn_client.create_namespaced_job(
                 body=_job_manifest, namespace=THOTH_DEPENDENCY_MONKEY_NAMESPACE)
-        except client.rest.ApiException as e:
-            logger.error(e)
+        except client.rest.ApiException as exc:
+            _LOGGER.error(exc)
 
-            if e.status == 403:
+            if exc.status == 403:
                 raise ServiceUnavailable('OpenShift auth failed')
 
             raise ServiceUnavailable('OpenShift')
 
-    def _get_all_scheduled_validation_job(self):  # pragma: no cover
-        logger.debug('looking for all validations')
+
+    def _get_all_scheduled_validation_job(self):# pragma: no cover
+        """Returns a list of all the jobs that have been scheduled for validation"""
+        _LOGGER.debug('looking for all validations')
 
         result = []
 
@@ -342,23 +364,25 @@ class ValidationDAO():
                     if job.metadata.name.startswith(VALIDATION_JOB_PREFIX):
                         result.append(job)
 
-        except client.rest.ApiException as e:
-            logger.error(e)
+        except client.rest.ApiException as exc:
+            _LOGGER.error(exc)
 
             if e.status == 403:
                 raise ServiceUnavailable('OpenShift auth failed')
 
             raise ServiceUnavailable('OpenShift')
 
-        except IndexError as e:
-            logger.debug('we got no jobs...')
+        except IndexError as exc:
+            _LOGGER.debug('we got no jobs...')
 
             return []
 
         return result
 
+
     def _get_scheduled_validation_job(self, id):  # pragma: no cover
-        logger.debug('looking for validation id {}'.format(id))
+        """Returns the scheduled validation for given ID"""
+        _LOGGER.debug('looking for validation id {}'.format(id))
 
         # if we got no BEARER_TOKEN, we use local config
         if self.BEARER_TOKEN is None:
@@ -375,23 +399,25 @@ class ValidationDAO():
 
             if not _resp.items is None:
                 return _resp.items[0]
-        except client.rest.ApiException as e:
-            logger.error(e)
+        except client.rest.ApiException as exc:
+            _LOGGER.error(exc)
 
-            if e.status == 403:
+            if exc.status == 403:
                 raise ServiceUnavailable('OpenShift auth failed')
 
             raise ServiceUnavailable('OpenShift')
 
-        except IndexError as e:
-            logger.debug('we got no jobs...')
+        except IndexError as exc:
+            _LOGGER.debug('we got no jobs...')
 
             return None
 
         return None
 
+
     def _get_job_log(self, id):  # pragma: no cover
-        logger.debug('getting logs for validation id {}'.format(id))
+        """Get logs from the pod that ran the validation job"""
+        _LOGGER.debug('getting logs for validation id {}'.format(id))
 
         # if we got no BEARER_TOKEN, we use local config
         if self.BEARER_TOKEN is None:
@@ -408,7 +434,7 @@ class ValidationDAO():
 
             for pod in _resp.items:
                 if 'job-name' in pod.metadata.labels.keys():
-                    logger.debug('found a Validation Job: {}'.format(
+                    _LOGGER.debug('found a Validation Job: {}'.format(
                         pod.metadata.labels['job-name']))
 
                     # TODO this may be more than one Pod (because it failed or so...)
@@ -418,8 +444,8 @@ class ValidationDAO():
 
                         return _log
 
-        except client.rest.ApiException as e:
-            logger.error(e)
+        except client.rest.ApiException as exc:
+            _LOGGER.error(exc)
 
             if e.status == 403:
                 raise ServiceUnavailable('OpenShift auth failed')

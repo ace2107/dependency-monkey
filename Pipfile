@@ -6,7 +6,7 @@ name = "pypi"
 [packages]
 flask-restplus = "==0.10.1"
 "ruamel.yaml" = "<=0.15"
-openshift = "==0.4.4"
+openshift = "==0.6.3"
 kubernetes = "==4.0.0"
 pip-tools = "==1.11.0"
 Flask = "==0.12.2"
