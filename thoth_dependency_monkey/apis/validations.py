@@ -17,6 +17,7 @@
 #   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 """Thoth: Dependency Monkey API"""
+import time
 
 from werkzeug.exceptions import BadRequest, ServiceUnavailable
 from flask import request
@@ -26,10 +27,12 @@ from thoth_dependency_monkey.validation_dao import ValidationDAO, NotFoundError
 from thoth_dependency_monkey.ecosystem import ECOSYSTEM, EcosystemNotSupportedError
 
 def before_request():
+    """Start time for query execution"""
     request.start_time = time.time()
 
 
-def query_time = after_request():
+def after_request():
+    """time takes for query to execute"""
     request_latency = time.time() - request.start_time
 
     return request_latency
