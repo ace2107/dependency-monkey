@@ -25,6 +25,14 @@ from flask_restplus import Namespace, Resource, fields
 from thoth_dependency_monkey.validation_dao import ValidationDAO, NotFoundError
 from thoth_dependency_monkey.ecosystem import ECOSYSTEM, EcosystemNotSupportedError
 
+def before_request():
+    request.start_time = time.time()
+
+
+def query_time = after_request():
+    request_latency = time.time() - request.start_time
+
+    return request_latency
 
 ns = Namespace('validations', description='Validations')  # pragma: no cover
 
@@ -67,27 +75,29 @@ class Validation(Resource):
     @ns.marshal_with(validation)
     def get(self, id):
         """Show a specific Validation"""
-
+        before_request()
         v = None
 
         try:
             v = DAO.get(id)
         except NotFoundError as err:
             ns.abort(404, "Validation {} doesn't exist".format(id))
+        query_time = after_request()
 
-        return v
+        return v, query_time
 
     @ns.doc('delete_validation')
     @ns.response(204, 'Validation deleted')
     def delete(self, id):
         """Delete a Validation given its identifier"""
-
+        before_request()
         try:
             v = DAO.delete(id)
         except NotFoundError as err:
             ns.abort(404, "Validation {} doesn't exist".format(id))
 
-        return '', 204
+        query_time = after_request()
+        return '', query_time, 204
 
 
 @ns.route('/')
@@ -98,13 +108,14 @@ class ValidationList(Resource):
     @ns.response(503, 'Service we depend on is not available')
     def get(self):
         """List all Validations"""
-
+        before_request()
         all_validations = DAO.get_all()
 
         if all_validations == None:
             return []
 
-        return all_validations
+        query_time = after_request()
+        return all_validations, query_time
 
     @ns.doc('request_validation')
     @ns.marshal_with(validation, code=201)
@@ -115,6 +126,7 @@ class ValidationList(Resource):
     def post(self):
         """Request a new Validation"""
 
+        before_request()
         try:
             # TODO check if we need to better safe guard this
             v = DAO.create(request.get_json())
@@ -126,4 +138,5 @@ class ValidationList(Resource):
             ns.abort(500, str(e))
             raise e
 
-        return v, 201
+        query_time = after_request()
+        return v, query_time, 201
