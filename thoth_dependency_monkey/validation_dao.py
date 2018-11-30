@@ -30,7 +30,7 @@ from tempfile import NamedTemporaryFile
 from kubernetes import client, config
 import requests
 
-from .exceptions import NotFoundError
+from .exceptions import NotFoundError, IncorrectStackFormatError, IncorrectPackageError
 
 from .ecosystem import ECOSYSTEM, EcosystemNotSupportedError
 
@@ -64,16 +64,19 @@ class ValidationDAO():
         except:
             _LOGGER.info("not running within an OpenShift cluster...")
 
-
+    @classmethod
     def _get_all_versions(self, package_name, version_no, char):
         """method to get all versions from pypi"""
         start = 5
         stop = 10
         pypi_url = "https://pypi.python.org/pypi/%s/json" % (package_name,)
+        #TODO : We should consider packages from other indices like the AICoE index(tensorflow)
         try:
-            r = requests.get(pypi_url, verify=False)
-        except requests.exceptions.HTTPError as exc:
-            _LOGGER.error(exc)
+            r = requests.get(pypi_url, verify=True)
+            if 400 <= r.status_code < 500:
+                raise IncorrectPackageError
+        except IncorrectPackageError:
+            _LOGGER.error("Incorrect package name provided. Please check package name {} again".format(package_name))
             return []
         else:
             data = r.json()
@@ -99,6 +102,48 @@ class ValidationDAO():
             sorted(versions, key=LooseVersion)
             versions = islice(versions, start, stop)
             return versions
+
+
+    def data_ingestion(self, v):
+        """Function to create large number of validation jobs for range of version indices"""
+
+        packages = v['stack_specification']
+        packages = packages.split("//")
+        package_versions = dict()
+        for name in packages:
+            pckg_name = re.findall("[a-zA-Z]+", name)
+            #checks if package name not entered
+            if not pckg_name:
+                break
+            #if incorrect version number or character,default is >0
+            ver_no = re.findall(r'\s*([\d.]+)', name)
+            if not ver_no:
+                ver_no = "0"
+            else:
+                ver_no = ver_no[0]
+            char = re.sub("[\w+.]", "", name)
+            if not char:
+                char = ">"
+            temp_dict = dict()
+            temp_dict = {pckg_name[0]:self._get_all_versions(pckg_name[0], ver_no, char)}
+
+            package_versions = {**package_versions, **temp_dict}
+
+        package_versions_list = [dict(zip(package_versions, v)) for v in product(*package_versions.values())]
+
+        _LOGGER.info(package_versions_list)
+
+        try: # for pip >= 10
+            from pip._internal.req import parse_requirements
+        except ImportError: #for pip <=9.0.3
+            from pip.req import parse_requirements
+
+        for spec in package_versions_list:
+            with NamedTemporaryFile(mode='w+', suffix='pysolve') as reqfile:
+                for key, value in spec.items():
+                    reqfile.write('{0}=={1}\n'.format(key, value))
+                    reqfile.flush()
+            self._schedule_validation_job(v['id'], reqfile, v['ecosystem'])
 
 
     def get(self, id):
@@ -178,7 +223,7 @@ class ValidationDAO():
         if data_ingestion_mode == True:
             data_ingestion(v)
             return v
-        
+
         # check if stack_specification is valid
         if not self._validate_requirements(v['stack_specification']):
             raise BadRequest('specification is not valid within Ecosystem {}'.format(v['ecosystem']))
@@ -188,46 +233,6 @@ class ValidationDAO():
         self._schedule_validation_job(v['id'], v['stack_specification'], v['ecosystem'])
 
         return v
-
-
-    def data_ingestion(self, v):
-        """Function to create large number of validation jobs for range of version indices"""
-
-        packages = v['stack_specification']
-        packages = packages.split("//")
-        package_versions = dict()
-        for name in packages:
-            pckg_name = re.findall("[a-zA-Z]+", name)
-            #checks if package name not entered
-            if not pckg_name:
-                break
-            #if incorrect version number or character,default is >0
-            ver_no = re.findall(r'\s*([\d.]+)', name)
-            if not ver_no:
-                ver_no = "0"
-            else:
-                ver_no = ver_no[0]
-            char = re.sub("[\w+.]", "", name)
-            if not char:
-                char = ">"
-            temp_dict = dict()
-            temp_dict = {pckg_name[0]:self._get_all_versions(pckg_name[0], ver_no, char)}
-
-            package_versions = {**package_versions, **temp_dict}
-
-        package_versions_list = [dict(zip(package_versions, v)) for v in product(*package_versions.values())]
-        
-        try: # for pip >= 10
-            from pip._internal.req import parse_requirements
-        except ImportError: #for pip <=9.0.3
-            from pip.req import parse_requirements
-
-        for spec in package_versions_list:
-            with NamedTemporaryFile(mode='w+', suffix='pysolve') as reqfile:
-                for key, value in spec.items():
-                    reqfile.write('{0}=={1}\n'.format(key, value))
-                    reqfile.flush()
-            self._schedule_validation_job(v['id'], reqfile, v['ecosystem'])
 
 
     def delete(self, id):
@@ -322,10 +327,9 @@ class ValidationDAO():
             config.load_kube_config()
         else:
             config.load_incluster_config()
-        """
-        _client = client.CoreV1Api()
-        _api = client.BatchV1Api()
-        """
+
+        #_client = client.CoreV1Api()
+        #_api = client.BatchV1Api()
 
         try:
             _resp = dyn_client.create_namespaced_job(

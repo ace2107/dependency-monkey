@@ -22,3 +22,6 @@ class IncorrectStackFormatError(Exception):
 
     def str(self):  # pragma: no cover
         return self.message
+
+class IncorrectPackageError(Exception):
+    """Incorrect package name provided"""
